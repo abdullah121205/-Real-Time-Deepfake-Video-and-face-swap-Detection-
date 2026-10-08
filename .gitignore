@@ -1,0 +1,43 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# Datasets
+data/
+*.zip
+*.rar
+*.7z
+
+# Trained models
+models/
+*.pth
+*.pt
+*.onnx
+*.h5
+*.keras
+
+# Results
+results/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
