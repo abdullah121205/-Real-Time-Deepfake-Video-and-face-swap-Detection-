@@ -15,22 +15,25 @@ __pycache__/
 .vscode/
 .idea/
 
-# Datasets
-data/
+# Datasets (large files excluded)
+data/raw/
+data/processed/
 *.zip
 *.rar
 *.7z
+*.tar.gz
 
-# Trained models
-models/
+# Trained heavy model checkpoints (lightweight face detector ONNX is tracked)
 *.pth
 *.pt
-*.onnx
 *.h5
 *.keras
 
-# Results
-results/
+# Output media
+results/*.mp4
+results/*.avi
+results/*.jpg
+results/*.png
 
 # Logs
 *.log
