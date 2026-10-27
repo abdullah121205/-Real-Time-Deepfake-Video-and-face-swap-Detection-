@@ -11,7 +11,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .utils import preprocess_face_for_model
+try:
+    from .utils import preprocess_face_for_model
+except (ImportError, ValueError):
+    from utils import preprocess_face_for_model
 
 
 class Meso4(nn.Module):

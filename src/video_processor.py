@@ -9,10 +9,16 @@ from typing import Dict, Generator, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
-from .deepfake_detector import DeepfakeDetector
-from .face_detector import FaceDetector
-from .face_swap_detector import FaceSwapDetector
-from .utils import TemporalSmoother, draw_detection_hud
+try:
+    from .deepfake_detector import DeepfakeDetector
+    from .face_detector import FaceDetector
+    from .face_swap_detector import FaceSwapDetector
+    from .utils import TemporalSmoother, draw_detection_hud
+except (ImportError, ValueError):
+    from deepfake_detector import DeepfakeDetector
+    from face_detector import FaceDetector
+    from face_swap_detector import FaceSwapDetector
+    from utils import TemporalSmoother, draw_detection_hud
 
 
 class VideoProcessor:
@@ -76,15 +82,16 @@ class VideoProcessor:
             faces = self.face_detector.detect_faces(frame_bgr)
 
             for face in faces:
-                crop = face["face_crop"]
-                face_id = face["face_id"]
+                crop = face.get("face_crop", face.get("crop"))
+                face_id = face.get("face_id", face.get("id", 0))
+                bbox = face.get("expanded_bbox", face.get("bbox"))
 
                 # 2. Deep learning classification
                 df_score, _ = self.deepfake_detector.predict(crop)
 
                 # 3. Forensic face-swap analysis
                 swap_report = self.face_swap_detector.analyze_face(crop)
-                swap_score = swap_report["swap_score"]
+                swap_score = swap_report.get("swap_score", 0.0)
 
                 # 4. Composite manipulation score
                 combined_score = (self.w_deepfake * df_score) + (self.w_swap * swap_score)
@@ -102,14 +109,14 @@ class VideoProcessor:
 
                 current_detections.append({
                     "face_id": face_id,
-                    "bbox": face["bbox"],
-                    "raw_bbox": face["raw_bbox"],
+                    "bbox": bbox,
+                    "raw_bbox": face.get("raw_bbox", face.get("bbox")),
                     "fake_score": smoothed_score,
                     "raw_score": combined_score,
                     "deepfake_score": df_score,
                     "swap_score": swap_score,
-                    "boundary_anomaly": swap_report["boundary_anomaly"],
-                    "freq_score": swap_report["frequency_anomaly"],
+                    "boundary_anomaly": swap_report.get("boundary_anomaly", 0.0),
+                    "freq_score": swap_report.get("frequency_anomaly", 0.0),
                     "label": label
                 })
 

@@ -96,13 +96,17 @@ class TestDeepfakeDetectionSystem(unittest.TestCase):
         report = detector.analyze_face(self.test_face)
 
         self.assertIn("swap_score", report)
+        self.assertIn("score", report)
         self.assertIn("boundary_anomaly", report)
         self.assertIn("frequency_anomaly", report)
         self.assertIn("color_disparity", report)
 
-        for key, val in report.items():
-            self.assertGreaterEqual(val, 0.0)
-            self.assertLessEqual(val, 1.0)
+        for metric in ["swap_score", "boundary_anomaly", "frequency_anomaly", "color_disparity"]:
+            self.assertGreaterEqual(report[metric], 0.0)
+            self.assertLessEqual(report[metric], 1.0)
+
+        self.assertGreaterEqual(report["score"], 0.0)
+        self.assertLessEqual(report["score"], 100.0)
 
     def test_hud_rendering(self):
         """Verify HUD rendering returns valid uint8 image with identical shape."""

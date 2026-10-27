@@ -1,245 +1,371 @@
 """
-Face detection and tracking module for real-time video frames.
-Supports OpenCV YuNet DNN detector with automatic model resolution and fallback mechanisms.
+Face detection, tracking, and landmark extraction module.
+Compatible with OpenCV 4.x (Haar + Facemark LBF) and OpenCV 5.x (YuNet DNN).
 """
 
+import math
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
-from .utils import crop_face_with_margin
+try:
+    from .face_swap_detector import FaceSwapDetector
+    from .utils import crop_face_with_margin
+except (ImportError, ValueError):
+    from face_swap_detector import FaceSwapDetector
+    from utils import crop_face_with_margin
+
+
+class FaceTracker:
+    """Tracks detected faces across frames and applies temporal EMA smoothing to bounding boxes."""
+
+    def __init__(self, max_distance: float = 150.0, max_disappeared: int = 10, smooth_factor: float = 0.3):
+        self.next_id = 1
+        self.tracked_faces: Dict[int, Tuple[int, int, int, int]] = {}  # ID -> (center_x, center_y, width, height)
+        self.disappeared: Dict[int, int] = {}                         # ID -> lost frame count
+        self.max_distance = max_distance
+        self.max_disappeared = max_disappeared
+        self.smooth_factor = smooth_factor
+
+    def update(self, faces: List[Dict]) -> List[Dict]:
+        """Matches faces to persistent IDs using centroid distance tracking."""
+        if len(faces) == 0:
+            for face_id in list(self.disappeared.keys()):
+                self.disappeared[face_id] += 1
+                if self.disappeared[face_id] > self.max_disappeared:
+                    del self.tracked_faces[face_id]
+                    del self.disappeared[face_id]
+            return faces
+
+        updated_tracked_faces = {}
+        matched_ids = set()
+
+        for face in faces:
+            x, y, width, height = face["bbox"]
+            center_x = x + width // 2
+            center_y = y + height // 2
+
+            best_id = None
+            min_dist = float("inf")
+
+            for face_id, (prev_x, prev_y, prev_w, prev_h) in self.tracked_faces.items():
+                if face_id in matched_ids:
+                    continue
+
+                dist = math.hypot(center_x - prev_x, center_y - prev_y)
+                if dist < min_dist and dist < self.max_distance:
+                    min_dist = dist
+                    best_id = face_id
+
+            if best_id is None:
+                best_id = self.next_id
+                self.next_id += 1
+            else:
+                # Smooth movement using Exponential Moving Average
+                px, py, pw, ph = self.tracked_faces[best_id]
+                center_x = int(px + self.smooth_factor * (center_x - px))
+                center_y = int(py + self.smooth_factor * (center_y - py))
+                width = int(pw + self.smooth_factor * (width - pw))
+                height = int(ph + self.smooth_factor * (height - ph))
+
+                face["bbox"] = (center_x - width // 2, center_y - height // 2, width, height)
+
+            updated_tracked_faces[best_id] = (center_x, center_y, width, height)
+            self.disappeared[best_id] = 0
+            matched_ids.add(best_id)
+            face["id"] = best_id
+            face["face_id"] = best_id
+
+        for face_id in list(self.tracked_faces.keys()):
+            if face_id not in matched_ids:
+                self.disappeared[face_id] += 1
+                if self.disappeared[face_id] <= self.max_disappeared:
+                    updated_tracked_faces[face_id] = self.tracked_faces[face_id]
+                else:
+                    del self.disappeared[face_id]
+
+        self.tracked_faces = updated_tracked_faces
+        return faces
 
 
 class FaceDetector:
     """
-    Detects faces in video frames and assigns persistent tracking IDs using IoU matching.
-    Provides cropped face images with context margins for deepfake forensic inspection.
+    Unified face detection and landmark extraction module.
+    Automatically detects available OpenCV backends (YuNet DNN or Haar Cascade)
+    and loads facial landmarks for forensic analysis.
     """
 
     def __init__(
         self,
-        backend: str = "yunet",
-        min_size: Tuple[int, int] = (40, 40),
-        confidence_threshold: float = 0.6,
+        backend: str = "auto",
+        scale_factor: float = 1.15,
+        min_neighbors: int = 5,
+        min_size: Tuple[int, int] = (60, 60),
         margin: float = 0.25,
+        confidence_threshold: float = 0.6,
         yunet_model_path: Optional[str] = None
     ):
-        """
-        Args:
-            backend: 'yunet' (high-accuracy DNN) or 'haar' / 'fallback'.
-            min_size: Minimum face detection dimensions (width, height).
-            confidence_threshold: Confidence threshold for detection.
-            margin: Extra context percentage to crop around face borders.
-            yunet_model_path: Path to face_detection_yunet_*.onnx model file.
-        """
         self.backend = backend.lower()
+        self.scale_factor = scale_factor
+        self.min_neighbors = min_neighbors
         self.min_size = min_size
-        self.confidence_threshold = confidence_threshold
         self.margin = margin
+        self.confidence_threshold = confidence_threshold
         self.yunet_model_path = yunet_model_path
 
-        # Persistent tracker state: face_id -> last_bbox
-        self.active_tracks: Dict[int, Tuple[int, int, int, int]] = {}
-        self.next_face_id: int = 0
+        self.tracker = FaceTracker()
+        self.swap_detector = FaceSwapDetector()
+        self.facemark = None
 
-        # Initialize detector backend
         self._init_backend()
+        self._init_facemark()
 
     def _init_backend(self):
         """Initializes face detector backend with fallback safety."""
-        # 1. Try finding YuNet ONNX model
-        candidate_paths = []
-        if self.yunet_model_path:
-            candidate_paths.append(Path(self.yunet_model_path))
-
-        # Check default project locations
         project_root = Path(__file__).resolve().parent.parent
-        candidate_paths.extend([
+
+        # Candidate paths for YuNet ONNX
+        candidate_paths = [
             project_root / "models" / "face_detection_yunet_2023mar.onnx",
             project_root / "models" / "face_detection_yunet.onnx",
             Path("models/face_detection_yunet_2023mar.onnx"),
             Path("models/face_detection_yunet.onnx"),
-        ])
+        ]
+        if self.yunet_model_path:
+            candidate_paths.insert(0, Path(self.yunet_model_path))
 
-        resolved_model = None
+        resolved_yunet = None
         for p in candidate_paths:
             if p.is_file():
-                resolved_model = str(p.resolve())
+                resolved_yunet = str(p.resolve())
                 break
 
-        if hasattr(cv2, "FaceDetectorYN") and resolved_model:
+        # 1. Prefer YuNet if model is present and cv2.FaceDetectorYN exists
+        if hasattr(cv2, "FaceDetectorYN") and resolved_yunet:
             try:
                 self.detector = cv2.FaceDetectorYN.create(
-                    model=resolved_model,
+                    model=resolved_yunet,
                     config="",
                     input_size=(320, 320),
                     score_threshold=self.confidence_threshold,
                     nms_threshold=0.3,
                     top_k=5000
                 )
-                self.backend = "yunet"
+                self.active_backend = "yunet"
                 return
             except Exception as e:
-                print(f"[FaceDetector] Warning: YuNet init failed ({e}). Falling back to alternate detector.")
+                print(f"[FaceDetector] Warning: YuNet init failed: {e}")
 
-        # 2. Try Haar Cascade if available in this OpenCV build
+        # 2. Try Haar Cascade if available
         if hasattr(cv2, "CascadeClassifier") and hasattr(cv2, "data") and hasattr(cv2.data, "haarcascades"):
             cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-            self.cascade = cv2.CascadeClassifier(cascade_path)
-            if not self.cascade.empty():
-                self.backend = "haar"
+            self.detector = cv2.CascadeClassifier(cascade_path)
+            if not self.detector.empty():
+                self.active_backend = "haar"
                 return
 
-        # 3. Built-in skin/contour heuristic fallback (guarantees zero crash in any environment)
-        self.backend = "heuristic"
+        # 3. Fallback
+        self.active_backend = "heuristic"
 
-    def detect_faces(self, frame_bgr: np.ndarray) -> List[Dict]:
+    def _init_facemark(self):
+        """Initializes OpenCV Facemark LBF if available in opencv-contrib."""
+        if hasattr(cv2, "face") and hasattr(cv2.face, "createFacemarkLBF"):
+            try:
+                facemark_model = Path(__file__).resolve().parent / "lbfmodel.yaml"
+                if facemark_model.is_file():
+                    self.facemark = cv2.face.createFacemarkLBF()
+                    self.facemark.loadModel(str(facemark_model))
+            except Exception as e:
+                print(f"[FaceDetector] Warning: Facemark LBF model loading error: {e}")
+                self.facemark = None
+
+    def detect_faces(self, frame: np.ndarray) -> List[Dict]:
         """
-        Finds all faces in a frame, tracks their identity across frames, and extracts crops.
-
-        Args:
-            frame_bgr: BGR video frame from camera or file.
-
-        Returns:
-            List of detection dictionaries.
+        Detects faces in a frame, tracks their identity across time, extracts crops,
+        and runs landmark and face-swap forensic analysis.
         """
-        h, w = frame_bgr.shape[:2]
-        raw_detections: List[Tuple[Tuple[int, int, int, int], float, Optional[np.ndarray]]] = []
+        if frame is None or frame.size == 0:
+            return []
 
-        if self.backend == "yunet" and hasattr(self, "detector"):
+        h, w = frame.shape[:2]
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        faces: List[Dict] = []
+
+        if self.active_backend == "yunet" and hasattr(self, "detector"):
             self.detector.setInputSize((w, h))
-            _, faces = self.detector.detect(frame_bgr)
-            if faces is not None:
-                for f in faces:
-                    confidence = float(f[-1])
-                    if confidence >= self.confidence_threshold:
-                        box = (int(f[0]), int(f[1]), int(f[2]), int(f[3]))
-                        # Ensure within bounds
-                        box = (
-                            max(0, box[0]),
-                            max(0, box[1]),
-                            min(w - max(0, box[0]), box[2]),
-                            min(h - max(0, box[1]), box[3])
-                        )
-                        if box[2] >= self.min_size[0] and box[3] >= self.min_size[1]:
-                            landmarks = f[4:14].reshape((5, 2))
-                            raw_detections.append((box, confidence, landmarks))
-        elif self.backend == "haar" and hasattr(self, "cascade"):
-            gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-            faces = self.cascade.detectMultiScale(
+            _, detections = self.detector.detect(frame)
+            if detections is not None:
+                for f in detections:
+                    conf = float(f[-1])
+                    if conf >= self.confidence_threshold:
+                        bx = max(0, int(f[0]))
+                        by = max(0, int(f[1]))
+                        bw = min(w - bx, int(f[2]))
+                        bh = min(h - by, int(f[3]))
+                        if bw >= self.min_size[0] and bh >= self.min_size[1]:
+                            landmarks_5 = f[4:14].reshape((5, 2))
+                            crop = frame[by:by + bh, bx:bx + bw].copy()
+                            faces.append({
+                                "bbox": (bx, by, bw, bh),
+                                "crop": crop,
+                                "confidence": conf,
+                                "raw_landmarks": landmarks_5
+                            })
+        elif self.active_backend == "haar" and hasattr(self, "detector"):
+            boxes = self.detector.detectMultiScale(
                 gray,
-                scaleFactor=1.15,
-                minNeighbors=5,
-                minSize=self.min_size,
-                flags=cv2.CASCADE_SCALE_IMAGE
+                scaleFactor=self.scale_factor,
+                minNeighbors=self.min_neighbors,
+                minSize=self.min_size
             )
-            for (x, y, fw, fh) in faces:
-                raw_detections.append(((x, y, fw, fh), 0.95, None))
-        else:
-            # Heuristic detector for synthetic tests or headless setups
-            raw_detections = self._heuristic_detect(frame_bgr)
-
-        # Associate detections with tracking IDs using Intersection over Union (IoU)
-        matched_results = self._match_tracks(raw_detections, frame_bgr)
-        return matched_results
-
-    def _heuristic_detect(
-        self, frame_bgr: np.ndarray
-    ) -> List[Tuple[Tuple[int, int, int, int], float, Optional[np.ndarray]]]:
-        """Fallback face detector based on skin chromaticity contours."""
-        h, w = frame_bgr.shape[:2]
-        hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        # Skin color range in HSV
-        lower_skin = np.array([0, 30, 60], dtype=np.uint8)
-        upper_skin = np.array([25, 255, 255], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower_skin, upper_skin)
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        detections = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area > (self.min_size[0] * self.min_size[1] * 1.5):
-                bx, by, bw, bh = cv2.boundingRect(c)
-                aspect_ratio = float(bw) / max(1, bh)
-                if 0.6 <= aspect_ratio <= 1.4:
-                    detections.append(((bx, by, bw, bh), 0.70, None))
-        return detections
-
-    def _match_tracks(
-        self,
-        raw_detections: List[Tuple[Tuple[int, int, int, int], float, Optional[np.ndarray]]],
-        frame_bgr: np.ndarray
-    ) -> List[Dict]:
-        """Matches current detections to existing track IDs to prevent flicker."""
-        results: List[Dict] = []
-        updated_tracks: Dict[int, Tuple[int, int, int, int]] = {}
-
-        unmatched_detections = list(enumerate(raw_detections))
-
-        # Match against existing tracks using highest IoU
-        for track_id, prev_box in list(self.active_tracks.items()):
-            best_iou = 0.0
-            best_idx = -1
-            best_det = None
-
-            for i, (orig_idx, (box, conf, landmarks)) in enumerate(unmatched_detections):
-                iou = self._calculate_iou(prev_box, box)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_idx = i
-                    best_det = (box, conf, landmarks)
-
-            if best_iou > 0.30 and best_det is not None:
-                box, conf, landmarks = best_det
-                updated_tracks[track_id] = box
-                del unmatched_detections[best_idx]
-
-                face_crop, expanded_box = crop_face_with_margin(frame_bgr, box, self.margin)
-                results.append({
-                    "face_id": track_id,
-                    "raw_bbox": box,
-                    "bbox": expanded_box,
-                    "face_crop": face_crop,
-                    "confidence": conf,
-                    "landmarks": landmarks
+            for (bx, by, bw, bh) in boxes:
+                crop = frame[by:by + bh, bx:bx + bw].copy()
+                faces.append({
+                    "bbox": (int(bx), int(by), int(bw), int(bh)),
+                    "crop": crop,
+                    "confidence": 0.95,
+                    "raw_landmarks": None
                 })
+        else:
+            # Heuristic detection for headless environments
+            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            mask = cv2.inRange(hsv, np.array([0, 30, 60]), np.array([25, 255, 255]))
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            for c in contours:
+                if cv2.contourArea(c) > (self.min_size[0] * self.min_size[1] * 1.5):
+                    bx, by, bw, bh = cv2.boundingRect(c)
+                    if 0.6 <= float(bw) / max(1, bh) <= 1.4:
+                        crop = frame[by:by + bh, bx:bx + bw].copy()
+                        faces.append({
+                            "bbox": (bx, by, bw, bh),
+                            "crop": crop,
+                            "confidence": 0.70,
+                            "raw_landmarks": None
+                        })
 
-        # New detections become new tracks
-        for _, (box, conf, landmarks) in unmatched_detections:
-            new_id = self.next_face_id
-            self.next_face_id += 1
-            updated_tracks[new_id] = box
+        # Track faces across frames
+        faces = self.tracker.update(faces)
 
-            face_crop, expanded_box = crop_face_with_margin(frame_bgr, box, self.margin)
-            results.append({
-                "face_id": new_id,
-                "raw_bbox": box,
-                "bbox": expanded_box,
-                "face_crop": face_crop,
-                "confidence": conf,
-                "landmarks": landmarks
-            })
+        # Extract landmarks and enrich with crops & swap analysis
+        for face in faces:
+            bx, by, bw, bh = face["bbox"]
+            face["raw_bbox"] = face["bbox"]
 
-        self.active_tracks = updated_tracks
-        return results
+            # Add context margin crop for deep learning
+            face_crop_expanded, expanded_box = crop_face_with_margin(frame, face["bbox"], self.margin)
+            face["face_crop"] = face_crop_expanded
+            face["expanded_bbox"] = expanded_box
 
-    @staticmethod
-    def _calculate_iou(boxA: Tuple[int, int, int, int], boxB: Tuple[int, int, int, int]) -> float:
-        """Calculates Intersection over Union between two (x, y, w, h) boxes."""
-        xA = max(boxA[0], boxB[0])
-        yA = max(boxA[1], boxB[1])
-        xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
-        yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+            # Facemark 68-point landmarks if available
+            landmarks_68 = []
+            if self.facemark is not None and len(faces) > 0:
+                try:
+                    boxes_arr = np.array([[bx, by, bw, bh]])
+                    success, landmarks_pts = self.facemark.fit(gray, boxes_arr)
+                    if success and len(landmarks_pts) > 0:
+                        pts = landmarks_pts[0][0]
+                        landmarks_68 = [list(pt) for pt in pts]
+                except Exception:
+                    landmarks_68 = []
 
-        inter_w = max(0, xB - xA)
-        inter_h = max(0, yB - yA)
-        inter_area = inter_w * inter_h
+            face["landmarks"] = landmarks_68 if landmarks_68 else face.get("raw_landmarks", [])
 
-        areaA = boxA[2] * boxA[3]
-        areaB = boxB[2] * boxB[3]
-        union_area = float(areaA + areaB - inter_area)
+            # Run face swap analysis
+            face["swap_analysis"] = self.swap_detector.analyze_face(frame, face)
 
-        if union_area <= 0:
-            return 0.0
-        return inter_area / union_area
+        return faces
+
+    def detect(self, frame: np.ndarray) -> Tuple[List[Dict], np.ndarray]:
+        """Convenience method returning (faces, frame)."""
+        faces = self.detect_faces(frame)
+        return faces, frame
+
+    def annotate_frame(self, frame: np.ndarray, faces: List[Dict]) -> np.ndarray:
+        """Draw bounding boxes and artifact annotations around detected faces."""
+        output = frame.copy()
+
+        for face in faces:
+            x, y, width, height = face["bbox"]
+            face_id = face.get("id", "?")
+            analysis = face.get("swap_analysis")
+
+            if analysis:
+                score = analysis.get("score", 0.0)
+                if analysis.get("quality") != "usable":
+                    text = f"ID:{face_id} | Analysis limited"
+                elif analysis.get("review_recommended"):
+                    text = f"ID:{face_id} | Review artifacts ({score})"
+                else:
+                    text = f"ID:{face_id} | Artifact index: {score}"
+            else:
+                text = f"ID:{face_id} | Analysis unavailable"
+
+            color = (0, 200, 255)
+            thickness = 2
+            length = int(width * 0.2)
+
+            # Draw Corner brackets
+            cv2.line(output, (x, y), (x + length, y), color, thickness)
+            cv2.line(output, (x, y), (x, y + length), color, thickness)
+            cv2.line(output, (x + width, y), (x + width - length, y), color, thickness)
+            cv2.line(output, (x + width, y), (x + width, y + length), color, thickness)
+            cv2.line(output, (x, y + height), (x + length, y + height), color, thickness)
+            cv2.line(output, (x, y + height), (x, y + height - length), color, thickness)
+            cv2.line(output, (x + width, y + height), (x + width - length, y + height), color, thickness)
+            cv2.line(output, (x + width, y + height), (x + width, y + height - length), color, thickness)
+
+            # Label text
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (text_w, text_h), _ = cv2.getTextSize(text, font, 0.5, 2)
+            cv2.rectangle(output, (x, max(y - text_h - 10, 0)), (x + text_w + 10, max(y, text_h + 10)), color, -1)
+            cv2.putText(output, text, (x + 5, max(y - 5, text_h + 5)), font, 0.5, (0, 0, 0), 2)
+
+        return output
+
+
+def process_video(source: Union[int, str] = 0):
+    """Detect faces from a webcam or video file."""
+    detector = FaceDetector()
+    video = cv2.VideoCapture(source)
+
+    if not video.isOpened():
+        raise RuntimeError(f"Cannot open video source: {source}")
+
+    try:
+        while True:
+            success, frame = video.read()
+            if not success:
+                break
+
+            frame = cv2.flip(frame, 1)
+            faces = detector.detect_faces(frame)
+            output = detector.annotate_frame(frame, faces)
+
+            cv2.putText(
+                output,
+                f"Faces detected: {len(faces)}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.8,
+                (0, 255, 255),
+                2
+            )
+
+            cv2.imshow("Face Detection", output)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+            if cv2.getWindowProperty("Face Detection", cv2.WND_PROP_VISIBLE) < 1:
+                break
+    finally:
+        video.release()
+        cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", default="0", help="Webcam index or path to video file")
+    args = parser.parse_args()
+    src = int(args.source) if args.source.isdigit() else args.source
+    process_video(src)
