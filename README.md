@@ -367,7 +367,7 @@ python app.py
 If Streamlit is used:
 
 ```bash
-streamlit run app.py
+streamlit run web_app.py
 ```
 
 The exact command may change depending on the final application architecture.

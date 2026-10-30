@@ -7,6 +7,7 @@ import argparse
 from pathlib import Path
 import sys
 import time
+from typing import Union
 import cv2
 import numpy as np
 import torch
@@ -136,9 +137,9 @@ def main():
     parser.add_argument(
         "--face-detector",
         type=str,
-        default="haar",
-        choices=["haar", "yunet"],
-        help="Face detector backend: 'haar' (fast CPU) or 'yunet' (high-accuracy DNN)"
+        default="yunet",
+        choices=["yunet", "haar"],
+        help="Face detector backend: 'yunet' (high-accuracy DNN) or 'haar' (fast CPU)"
     )
     parser.add_argument(
         "--stride",
@@ -176,6 +177,14 @@ def main():
         export_onnx(model_name=args.model, output_path=args.export_onnx)
         return
 
+    # Auto-resolve default weights if not specified
+    weights_path = args.weights
+    if not weights_path:
+        for candidate in [f"models/{args.model}_trained.pth", f"models/{args.model}_default.pth", f"models/{args.model}.pth"]:
+            if Path(candidate).is_file():
+                weights_path = candidate
+                break
+
     # Mode 3: Live Video / Camera Analysis
     print("=" * 60)
     print("  REAL-TIME DEEPFAKE & FACE-SWAP DETECTION SYSTEM")
@@ -184,8 +193,8 @@ def main():
     print(f"Model:         {args.model.upper()}")
     print(f"Face Backend:  {args.face_detector.upper()}")
     print(f"Frame Stride:  {args.stride}")
-    if args.weights:
-        print(f"Weights:       {args.weights}")
+    if weights_path:
+        print(f"Weights:       {weights_path}")
     if args.save:
         print(f"Output Video:  {args.save}")
     print("=" * 60)
@@ -201,7 +210,7 @@ def main():
             sys.exit(1)
 
     face_detector = FaceDetector(backend=args.face_detector)
-    deepfake_detector = DeepfakeDetector(model_name=args.model, weights_path=args.weights)
+    deepfake_detector = DeepfakeDetector(model_name=args.model, weights_path=weights_path)
     face_swap_detector = FaceSwapDetector()
     smoother = TemporalSmoother(window_size=12, alpha=0.35)
 
